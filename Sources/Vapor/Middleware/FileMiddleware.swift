@@ -1,9 +1,5 @@
 /// Serves static files from a public directory.
 ///
-///     middlewareConfig = MiddlewareConfig()
-///     middlewareConfig.use(FileMiddleware.self)
-///     services.register(middlewareConfig)
-///
 /// `FileMiddleware` will default to `DirectoryConfig`'s working directory with `"/Public"` appended.
 public final class FileMiddleware: Middleware {
     /// The public directory.
@@ -17,8 +13,10 @@ public final class FileMiddleware: Middleware {
 
     /// See `Middleware`.
     public func respond(to request: Request, chainingTo next: Responder) -> EventLoopFuture<Response> {
-        // make a copy of the path
-        var path = request.url.path
+        // make a copy of the percent-decoded path
+        guard var path = request.url.path.removingPercentEncoding else {
+            return request.eventLoop.makeFailedFuture(Abort(.badRequest))
+        }
 
         // path must be relative.
         while path.hasPrefix("/") {
@@ -31,7 +29,7 @@ public final class FileMiddleware: Middleware {
         }
 
         // create absolute file path
-        let filePath = publicDirectory + path
+        let filePath = self.publicDirectory + path
 
         // check if file exists and is not a directory
         var isDir: ObjCBool = false

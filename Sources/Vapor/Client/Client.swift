@@ -1,6 +1,14 @@
 public protocol Client {
-    var eventLoopGroup: EventLoopGroup { get }
+    var eventLoop: EventLoop { get }
+    func delegating(to eventLoop: EventLoop) -> Client
+    func logging(to logger: Logger) -> Client
     func send(_ request: ClientRequest) -> EventLoopFuture<ClientResponse>
+}
+
+extension Client {
+    public func logging(to logger: Logger) -> Client {
+        return self
+    }
 }
 
 extension Client {
@@ -34,7 +42,7 @@ extension Client {
         do {
             try beforeSend(&request)
         } catch {
-            return self.eventLoopGroup.next().makeFailedFuture(error)
+            return self.eventLoop.makeFailedFuture(error)
         }
         return self.send(request)
     }

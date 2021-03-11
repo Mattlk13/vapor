@@ -11,12 +11,22 @@ public final class Session {
     /// This session's data.
     public var data: SessionData
 
+    /// `true` if this session is still valid.
+    var isValid: Bool
+
     /// Create a new `Session`.
     ///
     /// Normally you will use `Request.session()` to do this.
     public init(id: SessionID? = nil, data: SessionData = .init()) {
         self.id = id
         self.data = data
+        self.isValid = true
+    }
+
+    /// Invalidates the current session, removing persisted data from the session driver
+    /// and invalidating the cookie.
+    public func destroy() {
+        self.isValid = false
     }
 }
 
@@ -24,5 +34,17 @@ public struct SessionID: Equatable, Hashable {
     public let string: String
     public init(string: String) {
         self.string = string
+    }
+}
+
+extension SessionID: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        try self.init(string: container.decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(self.string)
     }
 }

@@ -25,6 +25,102 @@ import Darwin
 /// Single-quoted strings are parsed literally. Double-quoted strings may contain escaped newlines
 /// that will be converted to actual newlines.
 public struct DotEnvFile {
+    /// Reads the dotenv files relevant to the environment and loads them into the process.
+    ///
+    ///     let environment: Environment
+    ///     let elgp: EventLoopGroupProvider
+    ///     let fileio: NonBlockingFileIO
+    ///     let logger: Logger
+    ///     try DotEnvFile.load(for: .development, on: elgp, fileio: fileio, logger: logger)
+    ///     print(Environment.process.FOO) // BAR
+    ///
+    /// - parameters:
+    ///     - environment: current environment, selects which .env file to use.
+    ///     - eventLoopGroupProvider: Either provides an EventLoopGroup or tells the function to create a new one.
+    ///     - fileio: NonBlockingFileIO that is used to read the .env file(s).
+    ///     - logger: Optionally provide an existing logger.
+    public static func load(
+        for environment: Environment = .development,
+        on eventLoopGroupProvider: Application.EventLoopGroupProvider = .createNew,
+        fileio: NonBlockingFileIO,
+        logger: Logger = Logger(label: "dot-env-loggger")
+    ) {
+        let eventLoopGroup: EventLoopGroup
+
+        switch eventLoopGroupProvider {
+        case .shared(let group):
+            eventLoopGroup = group
+        case .createNew:
+            eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+        }
+        defer {
+            switch eventLoopGroupProvider {
+            case .shared:
+                logger.trace("Running on shared EventLoopGroup. Not shutting down EventLoopGroup.")
+            case .createNew:
+                logger.trace("Shutting down EventLoopGroup")
+                do {
+                    try eventLoopGroup.syncShutdownGracefully()
+                } catch {
+                    logger.error("Shutting down EventLoopGroup failed: \(error)")
+                }
+            }
+        }
+
+        // Load specific .env first since values are not overridden.
+        DotEnvFile.load(path: ".env.\(environment.name)", on: .shared(eventLoopGroup), fileio: fileio, logger: logger)
+        DotEnvFile.load(path: ".env", on: .shared(eventLoopGroup), fileio: fileio, logger: logger)
+    }
+
+    /// Reads the dotenv files relevant to the environment and loads them into the process.
+    ///
+    ///     let path: String
+    ///     let elgp: EventLoopGroupProvider
+    ///     let fileio: NonBlockingFileIO
+    ///     let logger: Logger
+    ///     try DotEnvFile.load(path: path, on: elgp, fileio: filio, logger: logger)
+    ///     print(Environment.process.FOO) // BAR
+    ///
+    /// - parameters:
+    ///     - path: Absolute or relative path of the dotenv file.
+    ///     - eventLoopGroupProvider: Either provides an EventLoopGroup or tells the function to create a new one.
+    ///     - fileio: NonBlockingFileIO that is used to read the .env file(s).
+    ///     - logger: Optionally provide an existing logger.
+    public static func load(
+        path: String,
+        on eventLoopGroupProvider: Application.EventLoopGroupProvider = .createNew,
+        fileio: NonBlockingFileIO,
+        logger: Logger = Logger(label: "dot-env-loggger")
+    ) {
+        let eventLoopGroup: EventLoopGroup
+
+        switch eventLoopGroupProvider {
+        case .shared(let group):
+            eventLoopGroup = group
+        case .createNew:
+            eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+        }
+        defer {
+            switch eventLoopGroupProvider {
+            case .shared:
+                logger.trace("Running on shared EventLoopGroup. Not shutting down EventLoopGroup.")
+            case .createNew:
+                logger.trace("Shutting down EventLoopGroup")
+                do {
+                    try eventLoopGroup.syncShutdownGracefully()
+                } catch {
+                    logger.error("Shutting down EventLoopGroup failed: \(error)")
+                }
+            }
+        }
+
+        do {
+            try load(path: path, fileio: fileio, on: eventLoopGroup.next()).wait()
+        } catch {
+            logger.debug("Could not load \(path) file: \(error)")
+        }
+    }
+
     /// Reads a dotenv file from the supplied path and loads it into the process.
     ///
     ///     let fileio: NonBlockingFileIO
@@ -49,7 +145,7 @@ public struct DotEnvFile {
         return self.read(path: path, fileio: fileio, on: eventLoop)
             .map { $0.load(overwrite: overwrite) }
     }
-    
+
     /// Reads a dotenv file from the supplied path.
     ///
     ///     let fileio: NonBlockingFileIO
@@ -84,29 +180,29 @@ public struct DotEnvFile {
             return .init(lines: parser.parse())
         }
     }
-    
+
     /// Represents a `KEY=VALUE` pair in a dotenv file.
-    public struct Line: CustomStringConvertible {
+    public struct Line: CustomStringConvertible, Equatable {
         /// The key.
         public let key: String
-        
+
         /// The value.
         public let value: String
-        
+
         /// `CustomStringConvertible` conformance.
         public var description: String {
             return "\(self.key)=\(self.value)"
         }
     }
-    
+
     /// All `KEY=VALUE` pairs found in the file.
     public let lines: [Line]
-    
+
     /// Creates a new DotEnvFile
     init(lines: [Line]) {
         self.lines = lines
     }
-    
+
     /// Loads this file's `KEY=VALUE` pairs into the current process.
     ///
     ///     let file: DotEnvFile
@@ -122,15 +218,15 @@ public struct DotEnvFile {
     }
 }
 
-// MARK: Private
+// MARK: Parser
 
-private extension DotEnvFile {
+extension DotEnvFile {
     struct Parser {
         var source: ByteBuffer
         init(source: ByteBuffer) {
             self.source = source
         }
-        
+
         mutating func parse() -> [Line] {
             var lines: [Line] = []
             while let next = self.parseNext() {
@@ -138,7 +234,7 @@ private extension DotEnvFile {
             }
             return lines
         }
-        
+
         private mutating func parseNext() -> Line? {
             self.skipSpaces()
             guard let peek = self.peek() else {
@@ -160,14 +256,17 @@ private extension DotEnvFile {
                 return self.parseLine()
             }
         }
-        
+
         private mutating func skipComment() {
-            guard let commentLength = self.countDistance(to: .newLine) else {
-                return
+            let commentLength: Int
+            if let toNewLine = self.countDistance(to: .newLine) {
+                commentLength = toNewLine + 1 // include newline
+            } else {
+                commentLength = self.source.readableBytes
             }
-            self.source.moveReaderIndex(forwardBy: commentLength + 1) // include newline
+            self.source.moveReaderIndex(forwardBy: commentLength)
         }
-        
+
         private mutating func parseLine() -> Line? {
             guard let keyLength = self.countDistance(to: .equal) else {
                 return nil
@@ -179,13 +278,15 @@ private extension DotEnvFile {
             guard let value = self.parseLineValue() else {
                 return nil
             }
-            self.pop() // \n
             return Line(key: key, value: value)
         }
-        
+
         private mutating func parseLineValue() -> String? {
-            guard let valueLength = self.countDistance(to: .newLine) else {
-                return nil
+            let valueLength: Int
+            if let toNewLine = self.countDistance(to: .newLine) {
+                valueLength = toNewLine
+            } else {
+                valueLength = self.source.readableBytes
             }
             guard let value = self.source.readString(length: valueLength) else {
                 return nil
@@ -205,7 +306,7 @@ private extension DotEnvFile {
             default: return value
             }
         }
-        
+
         private mutating func skipSpaces() {
             scan: while let next = self.peek() {
                 switch next {
@@ -214,21 +315,26 @@ private extension DotEnvFile {
                 }
             }
         }
-        
+
         private func peek() -> UInt8? {
             return self.source.getInteger(at: self.source.readerIndex)
         }
-        
+
         private mutating func pop() {
             self.source.moveReaderIndex(forwardBy: 1)
         }
-        
+
         private func countDistance(to byte: UInt8) -> Int? {
             var copy = self.source
+            var found = false
             scan: while let next = copy.readInteger(as: UInt8.self) {
                 if next == byte {
+                    found = true
                     break scan
                 }
+            }
+            guard found else {
+                return nil
             }
             let distance = copy.readerIndex - source.readerIndex
             guard distance != 0 else {
@@ -243,15 +349,15 @@ private extension UInt8 {
     static var newLine: UInt8 {
         return 0xA
     }
-    
+
     static var space: UInt8 {
         return 0x20
     }
-    
+
     static var octothorpe: UInt8 {
         return 0x23
     }
-    
+
     static var equal: UInt8 {
         return 0x3D
     }

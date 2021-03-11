@@ -1,84 +1,92 @@
-/// Stores authenticated objects. This should be created
-/// using the request container as a singleton. Authenticated
-/// objects can then be stored here by middleware and fetched
-/// later in route closures.
-internal final class AuthenticationCache {
-    /// The internal storage.
-    private var storage: [ObjectIdentifier: Any]
-
-    /// Create a new authentication cache.
-    init() {
-        self.storage = [:]
+extension Request {
+    /// Helper for accessing authenticated objects.
+    /// See `Authenticator` for more information.
+    public var auth: Authentication {
+        return .init(request: self)
     }
 
-    /// Access the cache using types.
-    internal subscript<A>(_ type: A.Type) -> A?
-        where A: Authenticatable
-        {
-        get { return storage[ObjectIdentifier(A.self)] as? A }
-        set { storage[ObjectIdentifier(A.self)] = newValue }
+    /// Request helper for storing and fetching authenticated objects.
+    public struct Authentication {
+        let request: Request
+        init(request: Request) {
+            self.request = request
+        }
     }
 }
 
-// MARK: Request
+extension Request.Authentication {
+    /// Authenticates the supplied instance for this request.
+    public func login<A>(_ instance: A)
+        where A: Authenticatable
+    {
+        self.cache[A.self] = instance
+    }
 
-extension Request {
+    /// Unauthenticates an authenticatable type.
+    public func logout<A>(_ type: A.Type = A.self)
+        where A: Authenticatable
+    {
+        self.cache[A.self] = nil
+    }
+
     /// Returns an instance of the supplied type. Throws if no
     /// instance of that type has been authenticated or if there
     /// was a problem.
-    public func requireAuthenticated<A>(_ type: A.Type = A.self) throws -> A
+    @discardableResult public func require<A>(_ type: A.Type = A.self) throws -> A
         where A: Authenticatable
     {
-        guard let a = authenticated(A.self) else {
-            self.logger.error("\(A.self) has not been authorized")
+        guard let a = self.get(A.self) else {
             throw Abort(.unauthorized)
         }
         return a
     }
 
-    /// Authenticates the supplied instance for this request.
-    public func authenticate<A>(_ instance: A)
-        where A: Authenticatable
-    {
-        self._authenticationCache[A.self] = instance
-    }
-
     /// Returns the authenticated instance of the supplied type.
-    /// note: nil if no type has been authed.
-    public func authenticated<A>(_ type: A.Type = A.self) -> A?
+    /// - note: `nil` if no type has been authed.
+    public func get<A>(_ type: A.Type = A.self) -> A?
         where A: Authenticatable
     {
-        return self._authenticationCache[A.self]
+        return self.cache[A.self]
     }
 
-    /// Unauthenticates an authenticatable type.
-    public func unauthenticate<A>(_ type: A.Type = A.self)
+    /// Returns `true` if the type has been authenticated.
+    public func has<A>(_ type: A.Type = A.self) -> Bool
         where A: Authenticatable
     {
-        self._authenticationCache[A.self] = nil
+        return self.get(A.self) != nil
     }
 
-    /// Returns true if the type has been authenticated.
-    public func isAuthenticated<A>(_ type: A.Type = A.self) -> Bool
-        where A: Authenticatable
-    {
-        return self.authenticated(A.self) != nil
+    private final class Cache {
+        private var storage: [ObjectIdentifier: Any]
+
+        init() {
+            self.storage = [:]
+        }
+
+        internal subscript<A>(_ type: A.Type) -> A?
+            where A: Authenticatable
+            {
+            get { return storage[ObjectIdentifier(A.self)] as? A }
+            set { storage[ObjectIdentifier(A.self)] = newValue }
+        }
     }
 
-    internal var _authenticationCache: AuthenticationCache {
+    private struct CacheKey: StorageKey {
+        typealias Value = Cache
+    }
+
+    private var cache: Cache {
         get {
-            if let existing = self.userInfo[_authenticationCacheKey] as? AuthenticationCache {
+            if let existing = self.request.storage[CacheKey.self] {
                 return existing
             } else {
-                let new = AuthenticationCache()
-                self.userInfo[_authenticationCacheKey] = new
+                let new = Cache()
+                self.request.storage[CacheKey.self] = new
                 return new
             }
         }
         set {
-            self.userInfo[_authenticationCacheKey] = newValue
+            self.request.storage[CacheKey.self] = newValue
         }
     }
 }
-
-private let _authenticationCacheKey = "authc"

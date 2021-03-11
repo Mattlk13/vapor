@@ -1,33 +1,99 @@
+import Backtrace
+
 public final class Application {
     public var environment: Environment
-    public var services: Services
-    public let sync: Lock
-    public var userInfo: [AnyHashable: Any]
+    public let eventLoopGroupProvider: EventLoopGroupProvider
+    public let eventLoopGroup: EventLoopGroup
+    public var storage: Storage
     public private(set) var didShutdown: Bool
-    internal let eventLoopGroup: EventLoopGroup
     public var logger: Logger
     private var isBooted: Bool
 
-    public var providers: [Provider] {
-        return self.services.providers
-    }
-    
-    public init(environment: Environment = .development) {
-        self.environment = environment
-        self.services = .init()
-        self.sync = .init()
-        self.userInfo = [:]
-        self.didShutdown = false
-        self.eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-        self.logger = .init(label: "codes.vapor.application")
-        self.isBooted = false
-        self.registerDefaultServices()
+    public struct Lifecycle {
+        var handlers: [LifecycleHandler]
+        init() {
+            self.handlers = []
+        }
+
+        public mutating func use(_ handler: LifecycleHandler) {
+            self.handlers.append(handler)
+        }
     }
 
-    // MARK: Run
+    public var lifecycle: Lifecycle
+
+    public final class Locks {
+        public let main: Lock
+        var storage: [ObjectIdentifier: Lock]
+
+        init() {
+            self.main = .init()
+            self.storage = [:]
+        }
+
+        public func lock<Key>(for key: Key.Type) -> Lock
+            where Key: LockKey
+        {
+            self.main.lock()
+            defer { self.main.unlock() }
+            if let existing = self.storage[ObjectIdentifier(Key.self)] {
+                return existing
+            } else {
+                let new = Lock()
+                self.storage[ObjectIdentifier(Key.self)] = new
+                return new
+            }
+        }
+    }
+
+    public var locks: Locks
+
+    public var sync: Lock {
+        self.locks.main
+    }
+    
+    public enum EventLoopGroupProvider {
+        case shared(EventLoopGroup)
+        case createNew
+    }
+
+    public init(
+        _ environment: Environment = .development,
+        _ eventLoopGroupProvider: EventLoopGroupProvider = .createNew
+    ) {
+        Backtrace.install()
+        self.environment = environment
+        self.eventLoopGroupProvider = eventLoopGroupProvider
+        switch eventLoopGroupProvider {
+        case .shared(let group):
+            self.eventLoopGroup = group
+        case .createNew:
+            self.eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+        }
+        self.locks = .init()
+        self.didShutdown = false
+        self.logger = .init(label: "codes.vapor.application")
+        self.storage = .init(logger: self.logger)
+        self.lifecycle = .init()
+        self.isBooted = false
+        self.core.initialize()
+        self.caches.initialize()
+        self.views.initialize()
+        self.passwords.use(.bcrypt)
+        self.sessions.initialize()
+        self.sessions.use(.memory)
+        self.responder.initialize()
+        self.responder.use(.default)
+        self.servers.initialize()
+        self.servers.use(.http)
+        self.clients.initialize()
+        self.clients.use(.http)
+        self.commands.use(self.servers.command, as: "serve", isDefault: true)
+        self.commands.use(RoutesCommand(), as: "routes")
+        DotEnvFile.load(for: environment, on: .shared(self.eventLoopGroup), fileio: self.fileio, logger: self.logger)
+    }
     
     public func run() throws {
-        defer { self.shutdown() }
         do {
             try self.start()
             try self.running?.onStop.wait()
@@ -39,11 +105,10 @@ public final class Application {
     
     public func start() throws {
         try self.boot()
-        let eventLoop = self.make(EventLoop.self)
-        try self.loadDotEnv(on: eventLoop).wait()
-        let command = self.make(Commands.self).group()
-        let console = self.make(Console.self)
-        try console.run(command, input: self.environment.commandInput)
+        let command = self.commands.group()
+        var context = CommandContext(console: self.console, input: self.environment.commandInput)
+        context.application = self
+        try self.console.run(command, with: context)
     }
 
     public func boot() throws {
@@ -51,38 +116,32 @@ public final class Application {
             return
         }
         self.isBooted = true
-        try self.providers.forEach { try $0.willBoot(self) }
-        try self.providers.forEach { try $0.didBoot(self) }
-    }
-    
-    private func loadDotEnv(on eventLoop: EventLoop) -> EventLoopFuture<Void> {
-        return DotEnvFile.load(
-            path: ".env",
-            fileio: .init(threadPool: self.make()),
-            on: eventLoop
-        ).recover { error in
-            self.logger.debug("Could not load .env file: \(error)")
-        }
+        try self.lifecycle.handlers.forEach { try $0.willBoot(self) }
+        try self.lifecycle.handlers.forEach { try $0.didBoot(self) }
     }
     
     public func shutdown() {
         assert(!self.didShutdown, "Application has already shut down")
         self.logger.debug("Application shutting down")
 
-        self.logger.trace("Notifying service providers of shutdown")
-        self.services.providers.forEach { $0.willShutdown(self) }
+        self.logger.trace("Shutting down providers")
+        self.lifecycle.handlers.forEach { $0.shutdown(self) }
+        self.lifecycle.handlers = []
+        
+        self.logger.trace("Clearing Application storage")
+        self.storage.shutdown()
+        self.storage.clear()
 
-        self.logger.trace("Shutting down services")
-        self.services.shutdown()
-
-        self.logger.trace("Clearing Application.userInfo")
-        self.userInfo = [:]
-
-        self.logger.trace("Shutting down EventLoopGroup")
-        do {
-            try self.eventLoopGroup.syncShutdownGracefully()
-        } catch {
-            self.logger.error("Shutting down EventLoopGroup failed: \(error)")
+        switch self.eventLoopGroupProvider {
+        case .shared:
+            self.logger.trace("Running on shared EventLoopGroup. Not shutting down EventLoopGroup.")
+        case .createNew:
+            self.logger.trace("Shutting down EventLoopGroup")
+            do {
+                try self.eventLoopGroup.syncShutdownGracefully()
+            } catch {
+                self.logger.error("Shutting down EventLoopGroup failed: \(error)")
+            }
         }
 
         self.didShutdown = true
@@ -97,36 +156,4 @@ public final class Application {
     }
 }
 
-
-extension Application {
-    public var running: Running? {
-        get {
-            return self.make(RunningService.self).current
-        }
-        set {
-            self.make(RunningService.self).current = newValue
-        }
-    }
-}
-
-
-public struct Running {
-    public static func start(using promise: EventLoopPromise<Void>) -> Running {
-        return self.init(promise: promise)
-    }
-    
-    public var onStop: EventLoopFuture<Void> {
-        return self.promise.futureResult
-    }
-
-    private let promise: EventLoopPromise<Void>
-
-    public func stop() {
-        self.promise.succeed(())
-    }
-}
-
-final class RunningService {
-    var current: Running?
-    init() { }
-}
+public protocol LockKey { }

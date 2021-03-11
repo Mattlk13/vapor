@@ -2,7 +2,11 @@ import NIO
 
 extension Request {
     public var fileio: FileIO {
-        return .init(io: self.application.make(), allocator: self.application.make(), request: self)
+        return .init(
+            io: self.application.fileio,
+            allocator: self.application.allocator,
+            request: self
+        )
     }
 }
 
@@ -55,11 +59,11 @@ public struct FileIO {
     ///     print(data) // file data
     ///
     /// - parameters:
-    ///     - file: Path to file on the disk.
+    ///     - path: Path to file on the disk.
     /// - returns: `Future` containing the file data.
-    public func collectFile(at file: String) -> EventLoopFuture<ByteBuffer> {
+    public func collectFile(at path: String) -> EventLoopFuture<ByteBuffer> {
         var data = self.allocator.buffer(capacity: 0)
-        return self.readFile(at: file) { new in
+        return self.readFile(at: path) { new in
             var new = new
             data.writeBuffer(&new)
             return self.request.eventLoop.makeSucceededFuture(())
@@ -73,7 +77,7 @@ public struct FileIO {
     ///     }.wait()
     ///
     /// - parameters:
-    ///     - file: Path to file on the disk.
+    ///     - path: Path to file on the disk.
     ///     - chunkSize: Maximum size for the file data chunks.
     ///     - onRead: Closure to be called sequentially for each file data chunk.
     /// - returns: `Future` that will complete when the file read is finished.
@@ -88,7 +92,14 @@ public struct FileIO {
         else {
             return self.request.eventLoop.makeFailedFuture(Abort(.internalServerError))
         }
-        return self.read(path: path, fileSize: fileSize.intValue, chunkSize: chunkSize, onRead: onRead)
+        return self.read(
+            path: path,
+            fromOffset: 0,
+            byteCount:
+            fileSize.intValue,
+            chunkSize: chunkSize,
+            onRead: onRead
+        )
     }
 
     /// Generates a chunked `HTTPResponse` for the specified file. This method respects values in
@@ -101,11 +112,15 @@ public struct FileIO {
     ///     }
     ///
     /// - parameters:
-    ///     - file: Path to file on the disk.
+    ///     - path: Path to file on the disk.
     ///     - req: `HTTPRequest` to parse `"If-None-Match"` header from.
     ///     - chunkSize: Maximum size for the file data chunks.
     /// - returns: A `200 OK` response containing the file stream and appropriate headers.
-    public func streamFile(at path: String, chunkSize: Int = NonBlockingFileIO.defaultChunkSize) -> Response {
+    public func streamFile(
+        at path: String,
+        chunkSize: Int = NonBlockingFileIO.defaultChunkSize,
+        mediaType: HTTPMediaType? = nil
+    ) -> Response {
         // Get file attributes for this file.
         guard
             let attributes = try? FileManager.default.attributesOfItem(atPath: path),
@@ -115,6 +130,16 @@ public struct FileIO {
             return Response(status: .internalServerError)
         }
 
+        let contentRange: HTTPHeaders.Range?
+        if let rangeFromHeaders = request.headers.range {
+            if rangeFromHeaders.unit == .bytes && rangeFromHeaders.ranges.count == 1 {
+                contentRange = rangeFromHeaders
+            } else {
+                contentRange = nil
+            }
+        } else {
+            contentRange = nil
+        }
         // Create empty headers array.
         var headers: HTTPHeaders = [:]
 
@@ -123,24 +148,39 @@ public struct FileIO {
         headers.replaceOrAdd(name: .eTag, value: fileETag)
 
         // Check if file has been cached already and return NotModified response if the etags match
-        if fileETag == request.headers.firstValue(name: .ifNoneMatch) {
+        if fileETag == request.headers.first(name: .ifNoneMatch) {
             return Response(status: .notModified)
         }
 
         // Create the HTTP response.
         let response = Response(status: .ok, headers: headers)
-
+        let offset: Int64
+        let byteCount: Int
+        if let contentRange = contentRange {
+            response.status = .partialContent
+            response.headers.add(name: .accept, value: contentRange.unit.serialize())
+            if let firstRange = contentRange.ranges.first {
+                let range = firstRange.asResponseContentRange(limit: fileSize)
+                response.headers.contentRange = HTTPHeaders.ContentRange(unit: contentRange.unit, range: range)
+                (offset, byteCount) = firstRange.asByteBufferBounds(withMaxSize: fileSize)
+            } else {
+                offset = 0
+                byteCount = fileSize
+            }
+        } else {
+            offset = 0
+            byteCount = fileSize
+        }
         // Set Content-Type header based on the media type
         // Only set Content-Type if file not modified and returned above.
         if
             let fileExtension = path.components(separatedBy: ".").last,
-            let type = HTTPMediaType.fileExtension(fileExtension)
+            let type = mediaType ?? HTTPMediaType.fileExtension(fileExtension)
         {
             response.headers.contentType = type
         }
-
         response.body = .init(stream: { stream in
-            self.read(path: path, fileSize: fileSize, chunkSize: chunkSize) { chunk in
+            self.read(path: path, fromOffset: offset, byteCount: byteCount, chunkSize: chunkSize) { chunk in
                 return stream.write(.buffer(chunk))
             }.whenComplete { result in
                 switch result {
@@ -150,7 +190,7 @@ public struct FileIO {
                     stream.write(.end, promise: nil)
                 }
             }
-        }, count: fileSize)
+        }, count: byteCount)
         
         return response
     }
@@ -159,7 +199,8 @@ public struct FileIO {
     /// There may be use in publicizing this in the future for reads that must be async.
     private func read(
         path: String,
-        fileSize: Int,
+        fromOffset offset: Int64,
+        byteCount: Int,
         chunkSize: Int,
         onRead: @escaping (ByteBuffer) -> EventLoopFuture<Void>
     ) -> EventLoopFuture<Void> {
@@ -167,7 +208,8 @@ public struct FileIO {
             let fd = try NIOFileHandle(path: path)
             let done = self.io.readChunked(
                 fileHandle: fd,
-                byteCount: fileSize,
+                fromOffset: offset,
+                byteCount: byteCount,
                 chunkSize: chunkSize,
                 allocator: allocator,
                 eventLoop: self.request.eventLoop
@@ -180,6 +222,42 @@ public struct FileIO {
             return done
         } catch {
             return self.request.eventLoop.makeFailedFuture(error)
+        }
+    }
+    
+    /// Write the contents of buffer to a file at the supplied path.
+    ///
+    ///     let data = ByteBuffer(string: "ByteBuffer")
+    ///     try req.fileio.writeFile(data, at: "/path/to/file.txt").wait()
+    ///
+    /// - parameters:
+    ///     - path: Path to file on the disk.
+    ///     - buffer: The `ByteBuffer` to write.
+    /// - returns: `Future` that will complete when the file write is finished.
+    public func writeFile(_ buffer: ByteBuffer, at path: String) -> EventLoopFuture<Void> {
+        do {
+            let fd = try NIOFileHandle(path: path, mode: .write, flags: .allowFileCreation())
+            let done = io.write(fileHandle: fd, buffer: buffer, eventLoop: self.request.eventLoop)
+            done.whenComplete { _ in
+                try? fd.close()
+            }
+            return done
+        } catch {
+            return self.request.eventLoop.makeFailedFuture(error)
+        }
+    }
+}
+
+extension HTTPHeaders.Range.Value {
+    
+    fileprivate func asByteBufferBounds(withMaxSize size: Int) -> (offset: Int64, byteCount: Int) {
+        switch self {
+            case .start(let value):
+                return (offset: numericCast(value), byteCount: size - value)
+            case .tail(let value):
+                return (offset: numericCast(size - value), byteCount: value)
+            case .within(let start, let end):
+                return (offset: numericCast(start), byteCount: end + 1)
         }
     }
 }
